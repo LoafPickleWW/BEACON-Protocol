@@ -28,9 +28,9 @@ BEACON replaces the signaling broker entirely.
 
 ## Core Design
 
-### The Protocol Address: `[PROTOCOL_ADDRESS]`
+### The Protocol Address: `[YOUR_ADDRESS]`
 
-BEACON uses an open, shared protocol address as a public noticeboard. The protocol is completely open, so anyone can configure their client to monitor any address they choose. All BEACON traffic for a shared instance — offers, answers, pings, rejections — is sent to this address as 0 ALGO transactions with encrypted note fields.
+Each BEACON uses an custom protocol address as a public noticeboard. The protocol is completely open, so anyone can configure their client to monitor any address they choose. All BEACON traffic for a shared instance — offers, answers, pings, rejections — is sent to this address as 0 ALGO transactions with encrypted note fields.
 
 **How Crypto Solves Vendor Lock-in:** 
 By using a shared protocol address on a public ledger, BEACON removes the need for hosted backends. The blockchain acts as an immutable, globally available message bus. Developers don't have to worry about API rate limits from private companies, recurring server costs, or infrastructure deprecation. The network provides the service, paid for per-use (fractions of a cent) directly by the users, ensuring the signaling layer will outlive any individual application or company.

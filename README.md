@@ -2,7 +2,7 @@
 ### Blockchain-Encrypted Algorand Connection Over Note-field
 
 **Status:** RFC — Request for Comments  
-**Version:** 0.1  
+**Version:** 0.2  
 **Author:** [@loafpickleWW](https://github.com/loafpickleWW)  
 **Discussion:** Join the Discussions tab or open an issue on this repo
 
@@ -11,6 +11,8 @@
 ## Summary
 
 BEACON is a serverless, privacy-preserving signaling protocol that uses the Algorand note field to bootstrap peer-to-peer WebRTC connections between wallets — with no brokers, no relays, no third-party infrastructure, and no on-chain relationship metadata between communicating parties.
+
+Any Algorand address is natively a BEACON recipient. No key registration, no separate identity infrastructure, no NFD required. The recipient's wallet keypair is the only thing that can decrypt a message addressed to them — enforced by mathematics, not policy.
 
 ---
 
@@ -28,9 +30,9 @@ BEACON replaces the signaling broker entirely.
 
 ## Core Design
 
-### The Protocol Address: `[YOUR_ADDRESS]`
+### The Protocol Address
 
-Each BEACON uses an custom protocol address as a public noticeboard. The protocol is completely open, so anyone can configure their client to monitor any address they choose. All BEACON traffic for a shared instance — offers, answers, pings, rejections — is sent to this address as 0 ALGO transactions with encrypted note fields.
+BEACON uses an open, shared protocol address as a public noticeboard. The protocol is completely open, so anyone can configure their client to monitor any address they choose. All BEACON traffic for a shared instance — offers, answers, pings, rejections — is sent to this address as 0 ALGO transactions with encrypted note fields.
 
 **How Crypto Solves Vendor Lock-in:** 
 By using a shared protocol address on a public ledger, BEACON removes the need for hosted backends. The blockchain acts as an immutable, globally available message bus. Developers don't have to worry about API rate limits from private companies, recurring server costs, or infrastructure deprecation. The network provides the service, paid for per-use (fractions of a cent) directly by the users, ensuring the signaling layer will outlive any individual application or company.
@@ -43,24 +45,70 @@ Every BEACON client polls this address for new transactions. Decryption is the i
 - Note content is encrypted — an observer learns nothing about intent, recipient, or outcome.
 - All clients poll the same address, so polling behaviour reveals nothing about who you are expecting to hear from.
 - There is no on-chain link between any two communicating wallets.
+- The WebRTC session token is never present in the note — it is derived from the shared secret out of band.
 
-### Encryption
+### Encryption Model
 
-Notes are encrypted using NaCl box (X25519-XSalsa20-Poly1305):
+Algorand accounts are ed25519 keypairs. The public key is mathematically embedded in every Algorand address. BEACON converts this ed25519 public key to a curve25519 key using the well-defined Bernstein conversion, enabling NaCl box encryption directly to any Algorand address with no prior key exchange or registration step.
 
-- Sender generates an ephemeral keypair per message
-- Note is encrypted to recipient's known curve25519 public key
-- Ephemeral public key is included in the note payload for decryption
-- Recipient's address never appears anywhere in the transaction
+```
+algoAddress
+  → decode base32 → extract 32-byte ed25519 public key
+  → convert to curve25519 (Bernstein conversion)
+  → NaCl box encrypt
+```
 
-Public key discovery uses NFD metadata as the primary registry. A wallet publishes their curve25519 public key in their NFD properties. Senders resolve the recipient's NFD to retrieve it. This means any two NFD holders can BEACON each other with zero prior key exchange.
+This means any Algorand address is automatically a valid BEACON recipient. The sender needs nothing beyond the recipient's address to encrypt a message that only the recipient's wallet can decrypt.
 
-### Note Structure
+### Key Derivation
+
+```javascript
+import { convertPublicKey } from "ed2curve";
+
+function algoAddressToCurve25519(address) {
+  const decoded = algosdk.decodeAddress(address);
+  return convertPublicKey(decoded.publicKey);
+}
+```
+
+The `ed2curve` library implements the Bernstein conversion. `tweetnacl` handles the NaCl box encryption. Both are small, audited, and widely deployed.
+
+### Authentication via Simulate
+
+Rather than requiring a separate wallet prompt for every BEACON poll, recipient authentication uses Algorand's simulate endpoint — a dry-run transaction evaluation that requires a valid signature but never broadcasts to the network and costs nothing.
+
+```
+1. Client constructs a zero-cost transaction with a random nonce in the note field
+2. Submits to /v2/transactions/simulate — no broadcast, no fee, no user prompt
+3. Simulate confirms the signature is valid for the claimed address
+4. Client proceeds to attempt decryption
+```
+
+This proves the client controls the private key for a given address passively, without requiring active wallet approval on every poll cycle. It is the same proof-of-ownership mechanism used in BEACON's existing handshake flow, extended to work silently in the background.
+
+### Session Token Derivation
+
+The WebRTC peer ID never appears in the note payload. Instead, both sides independently derive a one-time session token from the shared secret established during the NaCl key exchange:
+
+```javascript
+const sharedSecret = nacl.box.before(senderPubkey, recipientSecretKey);
+const sessionToken = blake2bHex(
+  concat(sharedSecret, toBytes(offer.ts))
+).slice(0, 32);
+```
+
+Both sides compute the same token without communicating it. Alice registers as a WebRTC peer with `id = sessionToken`. Bob derives the same token and connects to it. The peer ID never touches the chain and never appears in any log in a form linkable to either wallet.
+
+The exact `ts` value from the offer note is used in derivation — not a rounded timestamp — so both sides converge on exactly the same token without ambiguity.
+
+---
+
+## Note Structure
 
 All notes are prefixed with `BEACON/1:` for indexer filtering, followed by a base64-encoded NaCl box:
 
 ```
-BEACON/1:<base64(nacl.box(JSON, nonce, recipientPubKey, ephemeralSecretKey))>
+BEACON/1:<base64(nacl.box(JSON, nonce, recipientCurve25519Key, ephemeralSecretKey))>
 ```
 
 The decrypted JSON payload:
@@ -69,8 +117,7 @@ The decrypted JSON payload:
 {
   "proto": "BEACON/1",
   "type": "offer",
-  "pid": "<WebRTC peer ID or session token>",
-  "pk": "<sender curve25519 pubkey>",
+  "pk": "<sender ephemeral curve25519 pubkey, base64>",
   "ts": 1718000000,
   "exp": 1718003600
 }
@@ -80,20 +127,21 @@ The decrypted JSON payload:
 |---|---|
 | `proto` | Protocol version string |
 | `type` | Message type (see below) |
-| `pid` | WebRTC peer ID or session identifier |
-| `pk` | Sender's curve25519 public key for reply encryption |
-| `ts` | Unix timestamp of issue |
-| `exp` | Unix timestamp of expiry — clients ignore stale messages |
+| `pk` | Sender's ephemeral curve25519 pubkey — recipient uses this to derive the shared secret and compute the session token |
+| `ts` | Unix timestamp of issue — used in session token derivation |
+| `exp` | Unix timestamp of expiry — clients must ignore stale messages |
+
+Note the absence of a `pid` field. The session token is derived, never transmitted.
 
 ### Message Types
 
 | Type | Direction | Description |
 |---|---|---|
 | `offer` | A → noticeboard | Initiator announces session availability |
-| `answer` | B → noticeboard | Responder confirms and provides their peer ID |
+| `answer` | B → noticeboard | Responder confirms readiness |
 | `reject` | B → noticeboard | Explicit decline, encrypted so only initiator sees it |
 | `ping` | Any → noticeboard | Presence beacon, no session implied |
-| `revoke` | A → noticeboard | Cancel a pending offer before it expires |
+| `revoke` | A → noticeboard | Cancel a pending offer before expiry |
 
 ---
 
@@ -102,29 +150,38 @@ The decrypted JSON payload:
 ```
 Alice                    Algorand (BEACON Address)              Bob
   │                                │                              │
-  │  1. Resolve Bob's pubkey       │                              │
-  │     via NFD metadata           │                              │
+  │  1. Derive curve25519 pubkey   │                              │
+  │     from Bob's algo address    │                              │
   │                                │                              │
-  │  2. Encrypt offer to Bob's     │                              │
-  │     pubkey, include own pid    │                              │
-  │     and pubkey for reply       │                              │
+  │  2. Generate ephemeral keypair │                              │
+  │     Encrypt offer to Bob's     │                              │
+  │     curve25519 key             │                              │
+  │     Note contains only:        │                              │
+  │     ephemeral pubkey + ts/exp  │                              │
   │                                │                              │
   │──── 0 ALGO + BEACON note ─────▶│                              │
   │                                │                              │
   │                                │◀──── polling every N secs ───│
+  │                                │      simulate auth           │
   │                                │      try decrypt all notes   │
-  │                                │      since last seen round   │
   │                                │                              │
   │                                │    Bob's key decrypts ✓      │
-  │                                │    extract Alice's pid       │
-  │                                │    and pubkey                │
+  │                                │    derive sharedSecret from  │
+  │                                │    ephemeral pubkey          │
+  │                                │    derive sessionToken       │
+  │                                │    from sharedSecret + ts    │
   │                                │                              │
   │                                │    Bob encrypts answer       │
-  │                                │    to Alice's pubkey         │
+  │                                │    to Alice's curve25519 key │
+  │                                │    (derived from her address)│
   │                                │                              │
   │◀──── polling every N secs ─────│◀─── 0 ALGO + BEACON note ───│
   │  Alice's key decrypts ✓        │                              │
-  │  extract Bob's pid             │                              │
+  │  derive same sessionToken      │                              │
+  │  from shared secret + ts       │                              │
+  │                                │                              │
+  │  Alice registers WebRTC        │    Bob connects to           │
+  │  peer as sessionToken          │    sessionToken peer ID      │
   │                                │                              │
   │◀═══════════════ direct WebRTC P2P connection ════════════════▶│
   │                                │                              │
@@ -144,7 +201,7 @@ GET /v2/accounts/{BEACON_ADDRESS}/transactions
   &limit=50
 ```
 
-`lastSeenRound` is persisted locally and updated after each poll. This ensures clients only process new transactions and never re-process stale traffic. The fixed address and shared note prefix makes this query extremely cache-friendly at the indexer level.
+`lastSeenRound` is persisted in localStorage and updated after each successful poll. Clients never reprocess old traffic. The fixed address and shared note prefix makes this query highly cache-friendly at the indexer level — every BEACON client in existence makes an identical request.
 
 **Suggested polling intervals:**
 
@@ -158,47 +215,90 @@ GET /v2/accounts/{BEACON_ADDRESS}/transactions
 
 ## Security Considerations
 
+**Ed25519 to curve25519 key conversion**
+Reusing a signing keypair for encryption is a practice that warrants explicit review. The Bernstein conversion is mathematically sound and used in production protocols. However, if the curve25519 private key were derivable from a compromised signing key, past encrypted messages could be exposed. Implementations should treat the converted key as equally sensitive to the signing key. Community review of this specific aspect is particularly welcomed.
+
 **Replay attacks**
-The `exp` field provides expiry. Clients must reject any message where `ts` is in the future by more than a clock-skew tolerance (suggested: 60 seconds) or where `exp` has passed.
+The `exp` field provides expiry. Clients must reject any message where `exp` has passed or where `ts` is more than 60 seconds in the future (clock skew tolerance).
 
 **Spam**
-The 0.001 ALGO minimum transaction fee provides natural rate limiting. A dedicated spam filter on the client — tracking sender addresses and drop-rate per round — is recommended for high-traffic deployments.
+The 0.001 ALGO minimum transaction fee provides natural rate limiting. Client-side filtering by drop rate per sender address per round is recommended for resilience.
 
-**Sender identity**
-The sender's Algorand address is visible on-chain. For stronger sender anonymity, clients may use a throwaway session wallet funded with a small amount of ALGO and discarded after the session. The protocol does not mandate this but implementations should make it easy.
+**Sender anonymity**
+The sender's Algorand address is visible on-chain. For stronger sender anonymity, clients may use a throwaway session wallet funded with a small amount of ALGO. The protocol does not mandate this but implementations should make it easy.
 
-**Key compromise**
-If a curve25519 private key is compromised, past messages encrypted to that key are exposed. Forward secrecy is not provided at the protocol level — this is a known limitation of the v1 spec and a candidate for a future revision.
+**Forward secrecy**
+Per-session ephemeral keypairs provide partial forward secrecy at the signaling layer — compromise of a long-term key does not expose past session tokens. Full forward secrecy at the communication layer depends on the WebRTC implementation. This is a known limitation of v1.
+
+**Rekeyed accounts**
+Algorand supports rekeying an account to a different spending key. In a rekeyed account the address-derived ed25519 key and the actual signing key diverge. BEACON encryption targets the address-derived key — a rekeyed account holder can still decrypt using the original private key even if they sign transactions with a different key. Implementations should document this clearly.
 
 **Protocol address**
-The protocol address is unowned and unspendable. Transactions sent to it are final. This is intentional — no party can censor the noticeboard or selectively block traffic.
+The protocol address is unowned and unspendable. No party can censor the noticeboard or selectively block traffic.
 
 ---
 
-## Open Questions for Discussion (We Need Your Input!)
+## Open Questions for Discussion
 
-This is the most critical section of the RFC. The Algorand developer community thrives on collaboration, and your input here will shape the protocol. Please drop into the **Discussions** tab to share your thoughts on the following:
+These are the areas where community input would be most valuable:
 
 1. **Protocol address selection** — Should this be a known burn address, a vanity address, or a multisig with no valid signers? What are the tradeoffs?
-2. **Public key registry** — NFD is the suggested primary registry but not everyone has an NFD. What should the fallback be? A prior BEACON self-transaction publishing your pubkey? A separate on-chain registry?
-3. **Note size constraints** — 1KB is sufficient for v1 but limits future extensibility. Should larger payloads reference an IPFS CID instead of embedding directly?
-4. **Forward secrecy** — Is this a v1 requirement or acceptable to defer? A double-ratchet style scheme would be complex but possible.
-5. **Group sessions** — Out of scope for v1 but worth designing around. Should the `pid` field support multi-peer session tokens?
-6. **Polling vs. webhooks** — AlgoNode and other indexers are exploring WebSocket support. Should BEACON specify a WebSocket mode for lower-latency knock delivery?
-7. **ARC number** — When this is ready to formalise, which ARC track is most appropriate?
+
+2. **Ed25519 → curve25519 conversion** — Is the community comfortable with this approach? Are there Algorand-specific concerns beyond the general cryptographic arguments?
+
+3. **Simulate as passive auth** — Are there edge cases where simulate-based authentication could be spoofed or bypassed? Particularly interested in rekeyed accounts and multisig wallets.
+
+4. **Session token derivation** — Is BLAKE2b the right choice here? Should the derivation include additional entropy beyond shared secret and timestamp?
+
+5. **Note size constraints** — 1KB is sufficient for v1 but limits future extensibility. Should larger payloads reference an IPFS CID instead of embedding directly?
+
+6. **Forward secrecy** — Is this a v1 requirement or acceptable to defer?
+
+7. **Multisig accounts** — How should BEACON handle multisig addresses where no single party holds the full private key?
+
+8. **ARC track** — When ready to formalise, which ARC track is most appropriate?
+
+---
+
+## Dependencies
+
+| Library | Purpose |
+|---|---|
+| `algosdk` | Address decoding, transaction construction, simulate |
+| `tweetnacl` | NaCl box encryption and decryption |
+| `ed2curve` | Ed25519 to curve25519 key conversion |
+| `@noble/hashes` or equivalent | BLAKE2b session token derivation |
+
+All are small, audited, and have no server-side requirements.
+
+---
+
+## Reference Implementation
+
+BEACON/1 is currently implemented in [Wen Tools P2P Chat](https://wentools.xyz) — a serverless, wallet-authenticated encrypted chat and file transfer tool built on Algorand. The implementation uses `@txnlab/use-wallet-react` for wallet connection, `tweetnacl` for encryption, and the AlgoNode public indexer for polling (no API key required).
 
 ---
 
 ## How to Give Feedback
 
-This is a draft RFC — nothing here is final. Please join the **Discussions** tab to share your thoughts, or open an **Issue** for specific bug reports or spec problems. We are specifically looking for:
+This is a draft RFC — nothing here is final. Open an issue on this repo to discuss any aspect of the protocol. Specifically looking for:
 
-- Security review of the encryption scheme
-- Thoughts on the protocol address approach
-- Use cases this could serve beyond P2P chat
-- Anything that seems underspecified or broken
+- Security review of the ed25519 → curve25519 conversion in this context
+- Review of the simulate-based authentication approach
+- Thoughts on the session token derivation scheme
+- Any Algorand-specific edge cases (rekeyed accounts, multisig, etc.)
+- Use cases beyond P2P chat this design could serve
 
-Pull requests to improve the spec are also welcome.
+Pull requests to improve the spec are welcome.
+
+---
+
+## Changelog
+
+| Version | Changes |
+|---|---|
+| 0.2 | Replaced curve25519 + NFD key registry with native ed25519→curve25519 address derivation. Added simulate-based passive authentication. Removed `pid` from note payload in favour of derived session tokens. Clarified rekeyed account behaviour. |
+| 0.1 | Initial draft |
 
 ---
 

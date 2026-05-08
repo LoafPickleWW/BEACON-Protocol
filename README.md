@@ -390,7 +390,9 @@ All are small, audited, and have no server-side requirements. The ed25519→curv
 
 ## Reference Implementation
 
-BEACON/1 is currently implemented in [Wen Tools P2P Chat](https://wentools.xyz) — a serverless, wallet-authenticated encrypted chat and file transfer tool built on Algorand. The implementation uses `@txnlab/use-wallet-react` for wallet connection, `tweetnacl` for encryption, and the AlgoNode public indexer for polling (no API key required).
+BEACON/1 is currently implemented in [Wen Tools BEACON Drop](https://www.wen.tools/beacon-drop) — a serverless, wallet-authenticated encrypted chat and file transfer tool built on Algorand. The codebase is fully open source and can be reviewed here: [BeaconDropTool.tsx on GitHub](https://github.com/LoafPickleWW/wen-tools/blob/main/src/pages/BeaconDropTool.tsx).
+
+The implementation uses `@txnlab/use-wallet-react` for wallet connection, `tweetnacl` for encryption, and the AlgoNode public indexer for polling (no API key required).
 
 ---
 

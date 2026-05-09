@@ -2,7 +2,7 @@
 ### Blockchain-Encrypted Algorand Connection Over Note-field
 
 **Status:** RFC — Request for Comments  
-**Version:** 0.4  
+**Version:** 0.5  
 **Author:** [@loafpickleWW](https://github.com/loafpickleWW)  
 **Discussion:** Join the Discussions tab or open an issue on this repo
 
@@ -93,13 +93,16 @@ const signed = await signTransactions([algosdk.encodeUnsignedTransaction(domainT
 const sigBytes = algosdk.decodeSignedTransaction(signed[0]).sig;
 
 // Derive deterministic curve25519 secret key from signature
-const webSecretKey = blake2b(sigBytes, { dkLen: 32 });
+// Taking first 32 bytes of SHA-512 hash to use built-in nacl.hash
+const webSecretKey = nacl.hash(sigBytes).slice(0, 32);
 const webKeypair = nacl.box.keyPair.fromSecretKey(webSecretKey);
 // webKeypair.publicKey  → the Web Public Key (wpk) to announce
 // webKeypair.secretKey  → used locally for decryption, never leaves the client
 ```
 
 The wallet prompt occurs once per session. Because all parameters are fixed and ed25519 is deterministic, the same wallet always produces the identical signature, recovering the identical curve25519 keypair on any device. No key material is stored server-side or in any database.
+
+**The web secret key is derived by taking the first 32 bytes of the SHA-512 hash of the signature. This allows implementations to use the built-in nacl.hash function, minimizing external dependencies.**
 
 **Implementations must not substitute live `suggestedParams` from the network.** Fields like `firstValid`, `lastValid`, and `fee` change constantly — any variation produces a different signature and therefore a different keypair, permanently breaking decryption of previously received messages.
 
@@ -194,9 +197,9 @@ The WebRTC peer ID never appears in any note payload. Both sides independently d
 
 ```javascript
 const sharedSecret = nacl.box.before(senderWpk, myWebSecretKey);
-const sessionToken = blake2bHex(
-  concatBytes(sharedSecret, toBytes(offer.ts))
-).slice(0, 32);
+const sessionToken = Buffer.from(
+  nacl.hash(concatBytes(sharedSecret, toBytes(offer.ts)))
+).toString('hex').slice(0, 32);
 ```
 
 Both sides compute the same token without communicating it. The initiator registers as a WebRTC peer with `id = sessionToken`. The responder derives the same token and connects to it. The peer ID never touches the chain and never appears in any log in a form linkable to either wallet.
@@ -362,7 +365,7 @@ Web key derivation requires a single wallet to sign the domain message. Multisig
 
 2. **Announce expiry** — Should `announce` transactions carry an `exp` field? Forcing rotation adds friction but improves hygiene. Should clients refuse to send to stale announcements?
 
-3. **Session token derivation** — Is BLAKE2b the right choice? Should the derivation include additional entropy beyond shared secret and timestamp?
+3. **Session token derivation** — Is SHA-512 (sliced to 32 bytes) the right choice? Should the derivation include additional entropy beyond shared secret and timestamp?
 
 4. **Note size constraints** — 1KB is sufficient for v1 but limits future extensibility. Should larger payloads reference an IPFS CID?
 
@@ -381,8 +384,7 @@ Web key derivation requires a single wallet to sign the domain message. Multisig
 | Library | Purpose |
 |---|---|
 | `algosdk` | Address decoding, transaction construction, simulate |
-| `tweetnacl` | NaCl box encryption, decryption, ephemeral keypair generation |
-| `@noble/hashes` | BLAKE2b for web key derivation and session token derivation |
+| `tweetnacl` | NaCl box encryption, decryption, ephemeral keypair generation, and SHA-512 hashing |
 
 All are small, audited, and have no server-side requirements. The ed25519→curve25519 conversion (`ed2curve`) used in earlier drafts has been removed — it is no longer part of the protocol.
 
@@ -414,6 +416,7 @@ Pull requests to improve the spec are welcome.
 
 | Version | Changes |
 |---|---|
+| 0.5 | Switched from BLAKE2b to SHA-512 (nacl.hash) for web key and session token derivation to eliminate the `@noble/hashes` dependency. |
 | 0.4 | Replaced generic domain transaction construction with canonical fixed-parameter recipe. Added `BEACON_GENESIS_HASH` constants. Documented unbroadcastable transaction as intentional security feature. Added Cross-device determinism and Domain transaction security considerations. Clarified that live `suggestedParams` must never be used. |
 | 0.3 | Replaced native ed25519→curve25519 conversion with signature-derived web key model. Added one-time `announce` message type. Added `announce-rotate` for key rotation with `supersedes` chaining. Removed `ed2curve` dependency. Clarified fundamental private key constraint and why native key conversion is not used. |
 | 0.2 | Replaced curve25519 + NFD key registry with native ed25519→curve25519 address derivation. Added simulate-based passive authentication. Removed `pid` from note payload in favour of derived session tokens. |

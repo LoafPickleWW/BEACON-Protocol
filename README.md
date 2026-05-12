@@ -175,7 +175,9 @@ The decrypted inner payload for `offer` and `answer`:
   "type": "offer",
   "wpk": "<sender's web public key, base64>",
   "ts": 1718000000,
-  "exp": 1718003600
+  "exp": 1718003600,
+  "part": 1,
+  "total": 1
 }
 ```
 
@@ -186,6 +188,8 @@ The decrypted inner payload for `offer` and `answer`:
 | `wpk` | Sender's web public key — recipient uses this to derive the shared secret and compute the session token |
 | `ts` | Unix timestamp of issue — used in session token derivation |
 | `exp` | Unix timestamp of expiry — clients must ignore stale messages |
+| `part` | (Optional) 1-based index for multi-part messages |
+| `total` | (Optional) Total count of fragments for multi-part messages |
 
 Note the absence of a `pid` field. The WebRTC session token is derived, never transmitted.
 
@@ -266,6 +270,35 @@ Sender                           Algorand (BEACON Address)            Receiver
 
 ---
 
+## Atomic Multi-Part Signaling
+
+Algorand imposes a strict 1KB limit on transaction notes. While most WebRTC handshakes fit within a single transaction, complex network topologies (e.g., multiple ICE candidates behind symmetric NATs) can occasionally exceed this limit. BEACON handles this via **Atomic Reassembly**.
+
+### Deterministic Fragmentation
+
+If a signaling payload exceeds 1024 bytes, the `sdp` string is split into two equal halves. Each fragment is sent as a separate transaction within the same atomic group.
+
+### Atomic Grouping (The Trick)
+
+The fragments are grouped using `algosdk.assignGroupID()`. This leverages the chain's atomicity guarantees:
+- **Single Prompt**: The sender's wallet treats the group as a single atomic unit, requiring only one user signature prompt.
+- **All-or-Nothing**: Either both fragments land on-chain, or neither does.
+
+### Indexer-Native Reassembly
+
+When scanning for offers or answers via the Indexer, the `tx.group` field is used as the primary correlation key. 
+
+**The Advantage:** Unlike using timestamps or sender addresses, the `group` ID is unique and immutable. It ensures that `Part 1` and `Part 2` are perfectly matched even if other transactions from the same sender are broadcast simultaneously or arrive out of order in indexer results.
+
+### Reassembly Logic
+
+1. **Detection**: If a decrypted note contains `total > 1`, it is identified as a fragment.
+2. **Buffering**: Fragments are stored in a Map keyed by `tx.group`.
+3. **Trigger**: Once the number of fragments associated with a specific `group` ID reaches the `total` count, the payload is reassembled by concatenating the fragments in order of their `part` index.
+4. **Initialization**: The WebRTC PeerConnection is initialized using the complete reassembled payload.
+
+---
+
 ## Key Rotation
 
 A wallet may rotate its web key at any time by broadcasting an `announce-rotate` transaction:
@@ -303,6 +336,8 @@ GET /v2/accounts/{BEACON_ADDRESS}/transactions
 ```
 
 `lastSeenRound` is persisted in localStorage and updated after each successful poll. Clients never reprocess old traffic. The fixed address and shared note prefix makes this query highly cache-friendly at the indexer level — every BEACON client in existence makes an identical request.
+
+**Reassembly Key:** For multi-part messages, the Indexer's `tx.group` field must be used to correlate fragments. This ensures atomicity even if the Indexer returns transactions out of order.
 
 For key announcement lookup, senders query by sender address:
 
@@ -367,7 +402,7 @@ Web key derivation requires a single wallet to sign the domain message. Multisig
 
 3. **Session token derivation** — Is SHA-512 (sliced to 32 bytes) the right choice? Should the derivation include additional entropy beyond shared secret and timestamp?
 
-4. **Note size constraints** — 1KB is sufficient for v1 but limits future extensibility. Should larger payloads reference an IPFS CID?
+4. **Note size constraints** — The 1KB limit is addressed by Atomic Multi-Part Signaling (up to 2KB). Should the protocol support even larger payloads via IPFS CID references?
 
 5. **Forward secrecy** — Is full double-ratchet style forward secrecy a v1 requirement or acceptable to defer?
 
@@ -416,7 +451,8 @@ Pull requests to improve the spec are welcome.
 
 | Version | Changes |
 |---|---|
-| 0.5 | Switched from BLAKE2b to SHA-512 (nacl.hash) for web key and session token derivation to eliminate the `@noble/hashes` dependency. |
+| 0.6 | Added Atomic Multi-Part Signaling. Introduced `part` and `total` metadata fields and established `tx.group` as the primary correlation key for payload reassembly. |
+| 0.5 | Switched from BLAKE2b to SHA-512 (nacl.hash) for web key and session token derivation to eliminate external dependencies and simplify cross-platform implementation. |
 | 0.4 | Replaced generic domain transaction construction with canonical fixed-parameter recipe. Added `BEACON_GENESIS_HASH` constants. Documented unbroadcastable transaction as intentional security feature. Added Cross-device determinism and Domain transaction security considerations. Clarified that live `suggestedParams` must never be used. |
 | 0.3 | Replaced native ed25519→curve25519 conversion with signature-derived web key model. Added one-time `announce` message type. Added `announce-rotate` for key rotation with `supersedes` chaining. Removed `ed2curve` dependency. Clarified fundamental private key constraint and why native key conversion is not used. |
 | 0.2 | Replaced curve25519 + NFD key registry with native ed25519→curve25519 address derivation. Added simulate-based passive authentication. Removed `pid` from note payload in favour of derived session tokens. |

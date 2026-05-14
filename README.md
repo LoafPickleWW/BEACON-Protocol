@@ -2,7 +2,7 @@
 ### Blockchain-Encrypted Algorand Connection Over Note-field
 
 **Status:** RFC — Request for Comments  
-**Version:** 0.5  
+**Version:** 0.6  
 **Author:** [@loafpickleWW](https://github.com/loafpickleWW)  
 **Discussion:** Join the Discussions tab or open an issue on this repo
 
